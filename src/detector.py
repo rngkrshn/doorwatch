@@ -1,55 +1,86 @@
+# src/detector.py
+from __future__ import annotations
+
 import cv2
 import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+ROI = Tuple[int, int, int, int]
+
+
+def _crop(frame: np.ndarray, roi: ROI) -> np.ndarray:
+    x, y, w, h = roi
+    return frame[y : y + h, x : x + w]
+
+
+def _to_gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img
+
+
+@dataclass
+class DetectorOutput:
+    motion_frac: float
+    delta_closed_frac: float
 
 
 class MotionDetector:
     """
-    Returns (motion_frac, delta_closed_frac)
-    delta_closed_frac compares current ROI to a fixed CLOSED reference ROI.
+    Computes:
+      - motion_frac: difference vs previous frame (useful to detect "something moved")
+      - delta_closed_frac: difference vs a closed-door reference frame (the actual door state signal)
     """
 
-    def __init__(self, roi, diff_threshold=25, blur_ksize=11, closed_ref_gray=None):
+    def __init__(
+        self,
+        roi: ROI,
+        diff_threshold: int = 25,
+        blur_ksize: int = 11,
+        closed_ref_path: str = "data/closed_ref.jpg",
+    ):
         self.roi = roi
         self.diff_threshold = diff_threshold
         self.blur_ksize = blur_ksize
 
-        self.prev_gray = None
+        ref = cv2.imread(closed_ref_path)
+        if ref is None:
+            raise RuntimeError(f"Could not load closed_ref image at: {closed_ref_path}")
 
-        if closed_ref_gray is None:
-            raise RuntimeError("closed_ref_gray must be provided (self-calibration expected).")
-        self.closed_ref_gray = closed_ref_gray
+        ref_roi = _crop(ref, self.roi)
+        ref_gray = _to_gray(ref_roi)
 
-    def _crop(self, frame):
-        x, y, w, h = self.roi
-        return frame[y : y + h, x : x + w]
+        if self.blur_ksize and self.blur_ksize > 1:
+            ref_gray = cv2.GaussianBlur(ref_gray, (self.blur_ksize, self.blur_ksize), 0)
 
-    def _preprocess(self, bgr):
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self.closed_ref_gray = ref_gray
+        self.prev_gray: Optional[np.ndarray] = None
+
+    def update(self, frame: np.ndarray) -> DetectorOutput:
+        roi_img = _crop(frame, self.roi)
+        gray = _to_gray(roi_img)
+
         if self.blur_ksize and self.blur_ksize > 1:
             gray = cv2.GaussianBlur(gray, (self.blur_ksize, self.blur_ksize), 0)
-        return gray
 
-    def _diff_frac(self, a_gray, b_gray):
-        diff = cv2.absdiff(a_gray, b_gray)
-        _, th = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-        return float(np.count_nonzero(th)) / th.size
+        # 1) Delta vs CLOSED reference (this is what your state machine should use)
+        diff_closed = cv2.absdiff(gray, self.closed_ref_gray)
+        _, mask_closed = cv2.threshold(
+            diff_closed, self.diff_threshold, 255, cv2.THRESH_BINARY
+        )
+        delta_closed_frac = float(np.count_nonzero(mask_closed)) / mask_closed.size
 
-    def update(self, frame):
-        roi_bgr = self._crop(frame)
-        cur_gray = self._preprocess(roi_bgr)
-
-        if cur_gray.shape != self.closed_ref_gray.shape:
-            raise RuntimeError(
-                f"ROI/ref size mismatch: cur={cur_gray.shape}, ref={self.closed_ref_gray.shape}"
-            )
-
-        delta_closed_frac = self._diff_frac(cur_gray, self.closed_ref_gray)
-
+        # 2) Motion vs previous frame (optional debugging / gating)
         if self.prev_gray is None:
-            self.prev_gray = cur_gray
-            return 0.0, delta_closed_frac
+            self.prev_gray = gray
+            return DetectorOutput(motion_frac=0.0, delta_closed_frac=delta_closed_frac)
 
-        motion_frac = self._diff_frac(cur_gray, self.prev_gray)
-        self.prev_gray = cur_gray
+        diff_prev = cv2.absdiff(gray, self.prev_gray)
+        _, mask_prev = cv2.threshold(
+            diff_prev, self.diff_threshold, 255, cv2.THRESH_BINARY
+        )
+        motion_frac = float(np.count_nonzero(mask_prev)) / mask_prev.size
 
-        return motion_frac, delta_closed_frac
+        self.prev_gray = gray
+        return DetectorOutput(motion_frac=motion_frac, delta_closed_frac=delta_closed_frac)

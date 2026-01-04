@@ -8,7 +8,8 @@ W, H = 640, 480
 
 # ROI = (x, y, width, height)
 # Start with full frame. After first run, narrow this to just the door edge/handle area.
-ROI = (0, 0, W, H)
+ROI = (360, 140, 120, 260)
+
 
 # Motion metric settings
 BLUR_KSIZE = 11          # odd number
